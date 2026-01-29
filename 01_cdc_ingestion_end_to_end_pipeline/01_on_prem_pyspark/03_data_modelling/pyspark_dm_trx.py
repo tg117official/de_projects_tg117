@@ -167,12 +167,12 @@ dim_product.show(5, truncate=False)
 # STEP 5: Build dim_date (raw)
 # Create date rows from min(order_ts) to max(order_ts)
 # -----------------------------
+# dim_date (fixed for Spark 3.5.x)
 min_max = (
     orders.select(
         F.min(F.to_date("order_ts")).alias("min_date"),
         F.max(F.to_date("order_ts")).alias("max_date")
-    )
-    .collect()[0]
+    ).collect()[0]
 )
 
 min_date = min_max["min_date"]
@@ -185,7 +185,9 @@ dim_date = (
     .withColumn("year_num", F.year("full_date").cast("int"))
     .withColumn("month_num", F.month("full_date").cast("int"))
     .withColumn("day_num", F.dayofmonth("full_date").cast("int"))
-    .withColumn("day_of_week", F.date_format("full_date", "u").cast("int"))
+    # dayofweek(): 1=Sunday ... 7=Saturday (Spark standard)
+    .withColumn("day_of_week", F.dayofweek("full_date").cast("int"))
+    # day name using supported pattern
     .withColumn("day_name", F.date_format("full_date", "EEE"))
     .select("date_key", "full_date", "year_num", "month_num", "day_num", "day_of_week", "day_name")
 )
