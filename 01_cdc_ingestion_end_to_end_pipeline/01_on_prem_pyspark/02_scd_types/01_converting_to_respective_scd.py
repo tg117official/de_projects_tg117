@@ -29,6 +29,9 @@ run2 = spark.createDataFrame([
 ], ["customer_id","first_name","last_name","email","city","phone","is_active","last_modified_ts"]) \
 .withColumn("last_modified_ts", F.to_timestamp("last_modified_ts"))
 
+run1.cache()
+run2.cache()
+
 print("\n=== RUN 1 (Initial Load) ===")
 run1.orderBy("customer_id").show(truncate=False)
 
@@ -100,16 +103,22 @@ dim2.orderBy("customer_id","version").show(truncate=False)
 current = dim2.filter("is_current = true").alias("c")
 s = run2.alias("s")
 
+s.select("customer_id", "city", "phone", "is_active").show()
+
 j = s.join(current, on="customer_id", how="left")
+
+# j.coalesce(1).orderBy("customer_id").write.option("header","true").csv(r"file:///C:\Users\Sandeep\Desktop\data\cdc_op\customers_op\steps")
 
 # Build change condition: (existing row) AND (any tracked column differs)
 change_cond = None
-for col in tracked_cols:
+for col in tracked_cols: # ["city", "phone", "is_active"]
     cond = (F.col(f"s.{col}") != F.col(f"c.{col}"))
     change_cond = cond if change_cond is None else (change_cond | cond)
 
+print(change_cond)
+
 changed_keys = (j
-    .filter(F.col("c.customer_id").isNotNull() & change_cond)
+    .filter(change_cond)
     .select("customer_id").distinct())
 
 print("\nChanged customer_ids (in run2):")
