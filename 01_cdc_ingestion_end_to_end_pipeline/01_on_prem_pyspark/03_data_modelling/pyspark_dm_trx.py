@@ -1,83 +1,120 @@
 # =========================================================
-# PYSPARK ETL: OLTP (normalized) -> OLAP (star schema)
+# PYSPARK SHELL RAW STEP BY STEP (No user-defined functions)
+# OLTP (MySQL normalized) -> OLAP (MySQL star schema)
+#
+# Run in pyspark shell:
+#   pyspark --jars /path/to/mysql-connector-j-8.x.x.jar
+#
+# Assumptions:
+#   MySQL has demo_oltp and demo_olap databases created
+#   demo_oltp tables: customers, categories, products, orders, order_items
+#   demo_olap tables: dim_customer, dim_product, dim_date, fact_sales
 # =========================================================
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 
-spark = SparkSession.builder.appName("oltp_to_olap_star_schema").getOrCreate()
+spark = SparkSession.builder.getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
 
 # -----------------------------
-# Config
+# STEP 1: Set MySQL connection info
 # -----------------------------
 MYSQL_HOST = "localhost"
 MYSQL_PORT = "3306"
 MYSQL_USER = "root"
-MYSQL_PASSWORD = "your_password"
+MYSQL_PASSWORD = "root"
 
 OLTP_DB = "demo_oltp"
 OLAP_DB = "demo_olap"
 
-OLTP_URL = f"jdbc:mysql://{MYSQL_HOST}:{MYSQL_PORT}/{OLTP_DB}?useSSL=false&allowPublicKeyRetrieval=true"
-OLAP_URL = f"jdbc:mysql://{MYSQL_HOST}:{MYSQL_PORT}/{OLAP_DB}?useSSL=false&allowPublicKeyRetrieval=true"
+OLTP_URL = "jdbc:mysql://{}:{}/{}?useSSL=false&allowPublicKeyRetrieval=true".format(MYSQL_HOST, MYSQL_PORT, OLTP_DB)
+OLAP_URL = "jdbc:mysql://{}:{}/{}?useSSL=false&allowPublicKeyRetrieval=true".format(MYSQL_HOST, MYSQL_PORT, OLAP_DB)
 
-JDBC_PROPS = {
-    "user": MYSQL_USER,
-    "password": MYSQL_PASSWORD,
-    "driver": "com.mysql.cj.jdbc.Driver",
-}
-
-def read_table(url: str, table: str):
-    return spark.read.jdbc(url=url, table=table, properties=JDBC_PROPS)
-
-def write_table(df, url: str, table: str, mode: str = "overwrite"):
-    (
-        df.write
-        .mode(mode)
-        .format("jdbc")
-        .option("url", url)
-        .option("dbtable", table)
-        .option("user", MYSQL_USER)
-        .option("password", MYSQL_PASSWORD)
-        .option("driver", JDBC_PROPS["driver"])
-        .option("batchsize", "2000")
-        .save()
-    )
-
-# Deterministic surrogate key approach
-# Using a stable hash of the natural key so keys do not change across reruns
-def sk_bigint(col_expr):
-    # Take first 16 hex chars of sha2 and convert from hex to bigint-like decimal string
-    # This keeps the key stable and reproducible for training
-    return F.conv(F.substring(F.sha2(col_expr, 256), 1, 16), 16, 10).cast("bigint")
+# JDBC read options reused by copy-paste
+# In pyspark shell, we use .format("jdbc").options(...).load()
+DRIVER = "com.mysql.cj.jdbc.Driver"
 
 # -----------------------------
-# 1) Read OLTP tables
+# STEP 2: Read OLTP tables (raw)
 # -----------------------------
-customers = read_table(OLTP_URL, "customers")
-categories = read_table(OLTP_URL, "categories")
-products = read_table(OLTP_URL, "products")
-orders = read_table(OLTP_URL, "orders")
-order_items = read_table(OLTP_URL, "order_items")
+customers = (
+    spark.read.format("jdbc")
+    .option("url", OLTP_URL)
+    .option("dbtable", "customers")
+    .option("user", MYSQL_USER)
+    .option("password", MYSQL_PASSWORD)
+    .option("driver", DRIVER)
+    .load()
+)
+
+categories = (
+    spark.read.format("jdbc")
+    .option("url", OLTP_URL)
+    .option("dbtable", "categories")
+    .option("user", MYSQL_USER)
+    .option("password", MYSQL_PASSWORD)
+    .option("driver", DRIVER)
+    .load()
+)
+
+products = (
+    spark.read.format("jdbc")
+    .option("url", OLTP_URL)
+    .option("dbtable", "products")
+    .option("user", MYSQL_USER)
+    .option("password", MYSQL_PASSWORD)
+    .option("driver", DRIVER)
+    .load()
+)
+
+orders = (
+    spark.read.format("jdbc")
+    .option("url", OLTP_URL)
+    .option("dbtable", "orders")
+    .option("user", MYSQL_USER)
+    .option("password", MYSQL_PASSWORD)
+    .option("driver", DRIVER)
+    .load()
+)
+
+order_items = (
+    spark.read.format("jdbc")
+    .option("url", OLTP_URL)
+    .option("dbtable", "order_items")
+    .option("user", MYSQL_USER)
+    .option("password", MYSQL_PASSWORD)
+    .option("driver", DRIVER)
+    .load()
+)
+
+# Optional: quick check
+print("OLTP counts")
+print("customers:", customers.count())
+print("categories:", categories.count())
+print("products:", products.count())
+print("orders:", orders.count())
+print("order_items:", order_items.count())
 
 # -----------------------------
-# 2) Build Dimensions
+# STEP 3: Build dim_customer (raw)
+# Surrogate key: deterministic from customer_id using sha2
 # -----------------------------
-
-# dim_customer
 dim_customer = (
     customers
     .select(
-        F.col("customer_id").cast("int"),
-        "first_name",
-        "last_name",
-        "email",
-        "city",
-        "state",
-        "created_at"
+        F.col("customer_id").cast("int").alias("customer_id"),
+        F.col("first_name").alias("first_name"),
+        F.col("last_name").alias("last_name"),
+        F.col("email").alias("email"),
+        F.col("city").alias("city"),
+        F.col("state").alias("state"),
+        F.col("created_at").alias("created_at")
     )
-    .withColumn("customer_key", sk_bigint(F.col("customer_id").cast("string")))
+    .withColumn(
+        "customer_key",
+        F.conv(F.substring(F.sha2(F.col("customer_id").cast("string"), 256), 1, 16), 16, 10).cast("bigint")
+    )
     .select(
         "customer_key",
         "customer_id",
@@ -90,7 +127,12 @@ dim_customer = (
     )
 )
 
-# dim_product with category denormalized
+dim_customer.show(5, truncate=False)
+
+# -----------------------------
+# STEP 4: Build dim_product (raw)
+# Denormalize category_name into product dimension
+# -----------------------------
 dim_product = (
     products.alias("p")
     .join(categories.alias("c"), F.col("p.category_id") == F.col("c.category_id"), "left")
@@ -101,9 +143,12 @@ dim_product = (
         F.col("c.category_name").alias("category_name"),
         F.col("p.list_price").cast("decimal(10,2)").alias("list_price"),
         F.col("p.is_active").cast("int").alias("is_active"),
-        F.col("p.created_at").alias("created_at"),
+        F.col("p.created_at").alias("created_at")
     )
-    .withColumn("product_key", sk_bigint(F.col("product_id").cast("string")))
+    .withColumn(
+        "product_key",
+        F.conv(F.substring(F.sha2(F.col("product_id").cast("string"), 256), 1, 16), 16, 10).cast("bigint")
+    )
     .select(
         "product_key",
         "product_id",
@@ -116,35 +161,43 @@ dim_product = (
     )
 )
 
-# dim_date derived from order_ts range
-min_max_dates = orders.select(
-    F.min(F.to_date("order_ts")).alias("min_date"),
-    F.max(F.to_date("order_ts")).alias("max_date")
-).collect()[0]
+dim_product.show(5, truncate=False)
 
-min_date = min_max_dates["min_date"]
-max_date = min_max_dates["max_date"]
+# -----------------------------
+# STEP 5: Build dim_date (raw)
+# Create date rows from min(order_ts) to max(order_ts)
+# -----------------------------
+min_max = (
+    orders.select(
+        F.min(F.to_date("order_ts")).alias("min_date"),
+        F.max(F.to_date("order_ts")).alias("max_date")
+    )
+    .collect()[0]
+)
 
-# Generate date sequence
+min_date = min_max["min_date"]
+max_date = min_max["max_date"]
+
 dim_date = (
-    spark.sql(f"SELECT sequence(to_date('{min_date}'), to_date('{max_date}'), interval 1 day) AS dts")
+    spark.sql("SELECT sequence(to_date('{}'), to_date('{}'), interval 1 day) AS dts".format(min_date, max_date))
     .select(F.explode("dts").alias("full_date"))
     .withColumn("date_key", F.date_format("full_date", "yyyyMMdd").cast("int"))
     .withColumn("year_num", F.year("full_date").cast("int"))
     .withColumn("month_num", F.month("full_date").cast("int"))
     .withColumn("day_num", F.dayofmonth("full_date").cast("int"))
-    .withColumn("day_of_week", F.date_format("full_date", "u").cast("int"))  # 1=Mon .. 7=Sun
+    .withColumn("day_of_week", F.date_format("full_date", "u").cast("int"))
     .withColumn("day_name", F.date_format("full_date", "EEE"))
     .select("date_key", "full_date", "year_num", "month_num", "day_num", "day_of_week", "day_name")
 )
 
-# -----------------------------
-# 3) Build Fact at order line grain
-# -----------------------------
-# Fact grain: one row per (order_id, line_number)
-# Measures: quantity, unit_price, discount_amount, gross_amount, net_amount
+dim_date.show(20, truncate=False)
 
-fact_base = (
+# -----------------------------
+# STEP 6: Build fact_sales (order line grain)
+# Each row represents one product in one order
+# Measures: quantity, unit_price, discount_amount, gross_amount, net_amount
+# -----------------------------
+fact_sales = (
     order_items.alias("oi")
     .join(orders.alias("o"), F.col("oi.order_id") == F.col("o.order_id"), "inner")
     .select(
@@ -152,19 +205,21 @@ fact_base = (
         F.col("oi.line_number").cast("int").alias("line_number"),
         F.col("o.customer_id").cast("int").alias("customer_id"),
         F.col("oi.product_id").cast("int").alias("product_id"),
-        F.to_date("o.order_ts").alias("order_date"),
+        F.to_date(F.col("o.order_ts")).alias("order_date"),
         F.col("o.order_status").alias("order_status"),
         F.col("oi.quantity").cast("int").alias("quantity"),
         F.col("oi.unit_price").cast("decimal(10,2)").alias("unit_price"),
         F.col("oi.discount_amount").cast("decimal(10,2)").alias("discount_amount")
     )
-)
-
-fact_sales = (
-    fact_base
-    .withColumn("customer_key", sk_bigint(F.col("customer_id").cast("string")))
-    .withColumn("product_key", sk_bigint(F.col("product_id").cast("string")))
-    .withColumn("date_key", F.date_format("order_date", "yyyyMMdd").cast("int"))
+    .withColumn(
+        "customer_key",
+        F.conv(F.substring(F.sha2(F.col("customer_id").cast("string"), 256), 1, 16), 16, 10).cast("bigint")
+    )
+    .withColumn(
+        "product_key",
+        F.conv(F.substring(F.sha2(F.col("product_id").cast("string"), 256), 1, 16), 16, 10).cast("bigint")
+    )
+    .withColumn("date_key", F.date_format(F.col("order_date"), "yyyyMMdd").cast("int"))
     .withColumn("gross_amount", (F.col("quantity") * F.col("unit_price")).cast("decimal(10,2)"))
     .withColumn("net_amount", (F.col("quantity") * F.col("unit_price") - F.col("discount_amount")).cast("decimal(10,2)"))
     .select(
@@ -182,38 +237,82 @@ fact_sales = (
     )
 )
 
-# Optional teaching rule
-# You can choose to exclude cancelled orders from analytics fact
-# For teaching, keep them and show how filters work
-# fact_sales = fact_sales.filter(F.col("order_status") != F.lit("CANCELLED"))
+fact_sales.show(20, truncate=False)
+
+# Optional: prove grain uniqueness (order_id, line_number should not duplicate)
+dup_cnt = fact_sales.groupBy("order_id", "line_number").count().filter(F.col("count") > 1).count()
+print("Duplicate grain rows:", dup_cnt)
 
 # -----------------------------
-# 4) Write to OLAP schema
+# STEP 7: Write to OLAP tables (overwrite for training)
 # -----------------------------
-# For training simplicity: overwrite tables each run
-# In production: use upsert and SCD patterns
+(
+    dim_customer.write.format("jdbc")
+    .mode("overwrite")
+    .option("url", OLAP_URL)
+    .option("dbtable", "dim_customer")
+    .option("user", MYSQL_USER)
+    .option("password", MYSQL_PASSWORD)
+    .option("driver", DRIVER)
+    .option("batchsize", "5000")
+    .save()
+)
 
-write_table(dim_customer, OLAP_URL, "dim_customer", mode="overwrite")
-write_table(dim_product, OLAP_URL, "dim_product", mode="overwrite")
-write_table(dim_date, OLAP_URL, "dim_date", mode="overwrite")
-write_table(fact_sales, OLAP_URL, "fact_sales", mode="overwrite")
+(
+    dim_product.write.format("jdbc")
+    .mode("overwrite")
+    .option("url", OLAP_URL)
+    .option("dbtable", "dim_product")
+    .option("user", MYSQL_USER)
+    .option("password", MYSQL_PASSWORD)
+    .option("driver", DRIVER)
+    .option("batchsize", "5000")
+    .save()
+)
+
+(
+    dim_date.write.format("jdbc")
+    .mode("overwrite")
+    .option("url", OLAP_URL)
+    .option("dbtable", "dim_date")
+    .option("user", MYSQL_USER)
+    .option("password", MYSQL_PASSWORD)
+    .option("driver", DRIVER)
+    .option("batchsize", "5000")
+    .save()
+)
+
+(
+    fact_sales.write.format("jdbc")
+    .mode("overwrite")
+    .option("url", OLAP_URL)
+    .option("dbtable", "fact_sales")
+    .option("user", MYSQL_USER)
+    .option("password", MYSQL_PASSWORD)
+    .option("driver", DRIVER)
+    .option("batchsize", "5000")
+    .save()
+)
+
+print("Write complete to demo_olap")
 
 # -----------------------------
-# 5) Validation queries in Spark
+# STEP 8: Quick validation queries in Spark (optional)
 # -----------------------------
-# Basic row counts
-print("dim_customer count:", dim_customer.count())
-print("dim_product count:", dim_product.count())
-print("dim_date count:", dim_date.count())
-print("fact_sales count:", fact_sales.count())
+print("OLAP counts in Spark objects")
+print("dim_customer:", dim_customer.count())
+print("dim_product:", dim_product.count())
+print("dim_date:", dim_date.count())
+print("fact_sales:", fact_sales.count())
 
-# Revenue by city example (star schema style)
+# Proof query: revenue by city using star schema dataframes
 rev_by_city = (
     fact_sales.alias("f")
     .join(dim_customer.alias("c"), F.col("f.customer_key") == F.col("c.customer_key"), "inner")
-    .groupBy("c.city")
-    .agg(F.sum("f.net_amount").alias("total_net_revenue"))
-    .orderBy(F.desc("total_net_revenue"))
+    .filter(F.col("f.order_status") == F.lit("PLACED"))
+    .groupBy(F.col("c.city"))
+    .agg(F.sum(F.col("f.net_amount")).alias("net_revenue"))
+    .orderBy(F.desc("net_revenue"))
 )
 
 rev_by_city.show(truncate=False)
